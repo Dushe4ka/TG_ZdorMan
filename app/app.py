@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import asyncio
 from aiogram.types import FSInputFile
 from service import notify_admins_about_new_payment, start_scheduler
-from test.database import get_all_clients, get_client_payments
+from database import get_all_clients, get_client_payments
 
 load_dotenv()
 
@@ -33,6 +33,7 @@ user_languages = {}
 class PaymentState(StatesGroup):
     waiting_for_username = State()
     waiting_for_hash = State()
+    waiting_for_confirmation = State()  # Новое состояние для подтверждения
 
 
 # Тексты на разных языках
@@ -40,7 +41,7 @@ TEXTS = {
     "en": {
         "start": "🌎 Choose a language:",
         "welcome": "Welcome to ZdorMan! You can pay for access to the TradingView indicator.",
-        "instruction": "📌 Instruction: [Click here](https://t.me/channel)",
+        "instruction": "📌 Instruction: [Click here](https://t.me/c/2063756053/31)",
         "enter_username": "Enter your TradingView username:",
         "payment_instructions": "Please send 35 USDT (TRC-20 network) to the following address:",
         "save_hash": "Save the transaction hash.",
@@ -55,12 +56,15 @@ TEXTS = {
         "admin_access_denied": "You don't have access to this command.",
         "no_clients": "No clients.",
         "select_client": "Select client:",
-        "client_not_found": "Client not found."
+        "client_not_found": "Client not found.",
+        "confirm_data": "📋 Please check your details:\n\n👤 TradingView username: {username}\n🔗 Transaction hash: {tx_hash}\n\nIs everything correct?",
+        "confirm_yes": "✅ All correct",
+        "confirm_no": "✏️ Edit"
     },
     "ru": {
         "start": "🌎 Выберите язык:",
         "welcome": "Добро пожаловать в ZdorMan! Здесь вы можете оплатить доступ к индикатору TradingView.",
-        "instruction": "📌 Инструкция: [Нажмите здесь](https://t.me/channel)",
+        "instruction": "📌 Инструкция: [Нажмите здесь](https://t.me/c/2063756053/31)",
         "enter_username": "Введите ваш никнейм TradingView:",
         "payment_instructions": "Пожалуйста, отправьте 35 USDT (сеть TRC-20) на следующий адрес:",
         "save_hash": "Сохраните хэш транзакции.",
@@ -75,12 +79,15 @@ TEXTS = {
         "admin_access_denied": "У вас нет доступа к этой команде.",
         "no_clients": "Клиентов нет.",
         "select_client": "Выберите клиента:",
-        "client_not_found": "Клиент не найден."
+        "client_not_found": "Клиент не найден.",
+        "confirm_data": "📋 Пожалуйста, проверьте введенные данные:\n\n👤 TradingView username: {username}\n🔗 Transaction hash: {tx_hash}\n\nВсе верно?",
+        "confirm_yes": "✅ Все верно",
+        "confirm_no": "✏️ Изменить"
     },
     "es": {
         "start": "🌎 Elige un idioma:",
         "welcome": "¡Bienvenido a ZdorMan! Aquí puedes pagar el acceso al indicador de TradingView.",
-        "instruction": "📌 Instrucción: [Haz clic aquí](https://t.me/channel)",
+        "instruction": "📌 Instrucción: [Haz clic aquí](https://t.me/c/2063756053/31)",
         "enter_username": "Ingrese su nombre de usuario de TradingView:",
         "payment_instructions": "Por favor, envíe 35 USDT (red TRC-20) a la siguiente dirección:",
         "save_hash": "Guarde el hash de la transacción.",
@@ -95,7 +102,10 @@ TEXTS = {
         "admin_access_denied": "No tienes acceso a este comando.",
         "no_clients": "No hay clientes.",
         "select_client": "Seleccione cliente:",
-        "client_not_found": "Cliente no encontrado."
+        "client_not_found": "Cliente no encontrado.",
+        "confirm_data": "📋 Por favor, verifique sus datos:\n\n👤 Nombre de usuario de TradingView: {username}\n🔗 Hash de transacción: {tx_hash}\n\n¿Todo correcto?",
+        "confirm_yes": "✅ Todo correcto",
+        "confirm_no": "✏️ Editar"
     }
 }
 
@@ -328,35 +338,60 @@ async def process_payment(message: types.Message, state: FSMContext):
     tx_hash = message.text
     lang = user_languages.get(message.from_user.id, "en")
 
+    # Сохраняем хэш в состоянии
+    await state.update_data(tx_hash=tx_hash)
+
+    # Формируем сообщение с данными для подтверждения
+    confirmation_message = TEXTS[lang]["confirm_data"].format(
+        username=username,
+        tx_hash=tx_hash
+    )
+
+    # Клавиатура с кнопками подтверждения
+    confirmation_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=TEXTS[lang]["confirm_yes"], callback_data="confirm_yes"),
+            InlineKeyboardButton(text=TEXTS[lang]["confirm_no"], callback_data="confirm_no")
+        ]
+    ])
+
+    await message.answer(confirmation_message, reply_markup=confirmation_keyboard)
+    await state.set_state(PaymentState.waiting_for_confirmation)
+
+
+@dp.callback_query(PaymentState.waiting_for_confirmation, lambda c: c.data == "confirm_yes")
+async def confirm_payment(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    username = data.get("username")
+    tx_hash = data.get("tx_hash")
+    lang = user_languages.get(callback.from_user.id, "en")
+
     purchase_date = datetime.now().strftime("%Y-%m-%d")
     subscription_end = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
 
     await save_user_payment(
-        user_id=message.from_user.id,
-        username=message.from_user.username,
+        user_id=callback.from_user.id,
+        username=callback.from_user.username,
         tw_username=username,
         tx_hash=tx_hash,
         purchase_date=purchase_date,
         subscription_end=subscription_end
     )
 
-    await message.answer(TEXTS[lang]["payment_received"])
+    await callback.message.edit_text(TEXTS[lang]["payment_received"])
     await state.clear()
 
-    # # Уведомление админов
-    # for admin in ADMIN_IDS:
-    #     admin_msg = (
-    #         f"💰 New payment!\n"
-    #         f"👤 ID: {message.from_user.id}\n"
-    #         f"👤 Username: @{message.from_user.username}\n"
-    #         f"👤 TW: {username}\n"
-    #         f"🔗 Hash: {tx_hash}\n"
-    #         f"📅 Purchase date: {purchase_date}\n"
-    #         f"📅 Subscription end: {subscription_end}"
-    #     )
-    #     await bot.send_message(admin, admin_msg)
-    # После сохранения платежа:
-    await notify_admins_about_new_payment(bot, message.from_user.id, tx_hash)
+    # Уведомление админов
+    await notify_admins_about_new_payment(bot, callback.from_user.id, tx_hash)
+    await callback.answer()
+
+
+@dp.callback_query(PaymentState.waiting_for_confirmation, lambda c: c.data == "confirm_no")
+async def reject_payment(callback: types.CallbackQuery, state: FSMContext):
+    lang = user_languages.get(callback.from_user.id, "en")
+    await callback.message.edit_text(TEXTS[lang]["enter_username"])
+    await state.set_state(PaymentState.waiting_for_username)
+    await callback.answer()
 
 
 @dp.message(lambda message: message.text in [
@@ -412,7 +447,8 @@ async def list_clients(callback: types.CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
-@ dp.callback_query(lambda c: c.data.startswith("client_"))
+
+@dp.callback_query(lambda c: c.data.startswith("client_"))
 async def client_info(callback: types.CallbackQuery):
     """Показывает информацию о клиенте и его платежах"""
     tw_username = callback.data.split("_")[1]
@@ -449,6 +485,7 @@ async def client_info(callback: types.CallbackQuery):
 
     await callback.message.answer(message, reply_markup=kb)
     await callback.answer()
+
 
 @dp.callback_query(lambda c: c.data.startswith("history_"))
 async def payment_history(callback: types.CallbackQuery):
