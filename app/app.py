@@ -1,6 +1,7 @@
 import os
 import logging
 import aiosqlite
+import json # Для возможной персистентности кеша
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import (
@@ -14,21 +15,20 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import asyncio
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ChatAction # <-- Импорт для статуса "Отправка документа..."
 
 # Импорты из ваших модулей
-# Убедитесь, что эти файлы существуют и функции доступны
 try:
     from service import notify_admins_about_new_payment, start_scheduler
     from database import (
         init_db as init_database_module,
         save_payment as save_payment_db,
-        get_distinct_tw_usernames_with_users, # Новый запрос для админки
-        get_payments_for_tw_account,         # Новый/переименованный запрос
-        get_user_language # Функция для получения языка
+        get_distinct_tw_usernames_with_users,
+        get_payments_for_tw_account,
+        get_user_language
     )
 except ImportError as e:
     logging.error(f"Ошибка импорта: {e}. Убедитесь, что файлы database.py и service.py существуют и содержат нужные функции.")
-    # Завершаем работу, если критические модули не найдены
     exit()
 
 
@@ -39,7 +39,9 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
 TRC20_WALLET = os.getenv("TRC20_WALLET")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
-DATABASE_FILE = "bot_database.db" # Определим имя файла БД здесь
+DATABASE_FILE = "bot_database.db"
+MEDIA_DIR = "media"
+CACHE_FILE = "instruction_cache.json" # Файл для сохранения file_id
 
 # Проверка наличия обязательных переменных окружения
 if not all([TOKEN, ADMIN_IDS_STR, TRC20_WALLET, ADMIN_USERNAME]):
@@ -57,6 +59,33 @@ bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+# --- Кеш для file_id инструкций ---
+instruction_file_ids = {}
+
+# Функция для загрузки кеша из файла
+def load_cache():
+    global instruction_file_ids
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                instruction_file_ids = json.load(f)
+            logging.info(f"Кеш file_id инструкций загружен из {CACHE_FILE}.")
+        except Exception as e:
+            logging.error(f"Не удалось загрузить кеш file_id из {CACHE_FILE}: {e}")
+            instruction_file_ids = {} # Начинаем с пустого кеша при ошибке
+    else:
+        logging.info(f"Файл кеша {CACHE_FILE} не найден, кеш пуст.")
+        instruction_file_ids = {}
+
+# Функция для сохранения кеша в файл
+def save_cache():
+    try:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(instruction_file_ids, f, indent=4)
+        # logging.info(f"Кеш file_id инструкций сохранен в {CACHE_FILE}.") # Можно логировать, если нужно
+    except Exception as e:
+        logging.error(f"Не удалось сохранить кеш file_id в {CACHE_FILE}: {e}")
+
 # Храним выбранный язык пользователя в памяти (для быстрого доступа)
 user_languages = {}
 
@@ -68,39 +97,39 @@ PLANS = {
 }
 
 # --- Машина состояний для оплаты ---
+# (PaymentState - остается без изменений)
 class PaymentState(StatesGroup):
     waiting_for_plan_selection = State()
-    waiting_for_tw_username = State()   # Новое состояние для ввода TW username
+    waiting_for_tw_username = State()
     waiting_for_hash = State()
     waiting_for_confirmation = State()
 
-# --- Тексты на разных языках (обновлены/добавлены) ---
+# --- Тексты на разных языках ---
+# (TEXTS - остается без изменений)
 TEXTS = {
     "en": {
         "start": "🌎 Choose a language:",
         "welcome": "Welcome to ZdorMan! Here you can pay for access to the TradingView indicator.",
-        "instruction": "📌 Instruction: [Click here](https://t.me/c/2063756053/31)",
+        "instruction_caption": "📌 Here is the instruction manual:",
+        "instruction_error": "⚠️ The instruction file could not be found. Please contact support.",
         "choose_plan": "💳 Choose your subscription plan:",
-        # Новый текст для запроса TW username
         "enter_tw_username": "Enter the TradingView username for which you want to pay:",
         "payment_instructions": "Please send {amount} USDT (TRC-20 network) to the following address:",
         "save_hash": "Save the transaction hash.",
         "enter_hash": "Please send the transaction hash:",
         "payment_received": "✅ Your payment for TradingView account **{tw_username}** has been recorded and will be processed soon.",
-        # Уведомления теперь включают TW username
         "subscription_expired_for": "❌ Your subscription for TradingView account **{tw_username}** has expired on {date}.",
         "subscription_warning_for": "⚠️ Your subscription for TradingView account **{tw_username}** will expire in {days} days on {date}.",
-        "generic_subscription_expired": "Your subscription has expired.", # Общее сообщение, если TW не указан
-        "generic_subscription_warning": "Your subscription will expire in {days} days on {date}.", # Общее сообщение, если TW не указан
+        "generic_subscription_expired": "Your subscription has expired.",
+        "generic_subscription_warning": "Your subscription will expire in {days} days on {date}.",
         "support": f"For assistance, please contact @{ADMIN_USERNAME}",
         "paid_button": "✅ Paid",
         "help_button": "🆘 Help",
         "main_menu": ["📜 Instruction", "💳 Payment", "🆘 Support"],
         "admin_access_denied": "You don't have access to this command.",
-        "no_tw_accounts": "No TradingView accounts found.", # Изменено с no_clients
-        "select_tw_account": "Select TradingView account:", # Изменено с select_client
-        "client_not_found": "TradingView account data not found.", # Изменено
-        # Обновлен для отображения TW username
+        "no_tw_accounts": "No TradingView accounts found.",
+        "select_tw_account": "Select TradingView account:",
+        "client_not_found": "TradingView account data not found.",
         "confirm_data": "📋 Please check your details:\n\n👤 TradingView username: **{tw_username}**\n💰 Plan: {plan_name} ({amount} USDT)\n🔗 Transaction hash: `{tx_hash}`\n\nIs everything correct?",
         "confirm_yes": "✅ All correct",
         "confirm_no": "✏️ Edit",
@@ -123,22 +152,21 @@ TEXTS = {
         "admin_back_to_list": "⬅️ Back to List",
         "admin_back_to_main": "⬅️ Back to Main Menu",
         "admin_history_title": "📜 Payment History for {tw_username}",
-        "admin_payment_entry": "➡️ Payment #{i}\n📅 Date: {date}\n💰 Amount: {amount} USDT\n🔗 Hash: `{hash}`\n⏳ End Date: {end_date}\n👤 Paid by: @{tg_username} (ID: `{user_id}`)\n\n",
+        "admin_payment_entry": "➡️ Payment #{i}\n📅 Date: {date}\n💰 Amount: {amount} USDT\n🔗 Hash: `{hash}`\n⏳ End Date: {end_date}\n👤 Paid by: @{tg_username} (ID: `{user_id}`)\n",
          "admin_back_to_account": "⬅️ Back to Account Info",
 
     },
     "ru": {
         "start": "🌎 Выберите язык:",
         "welcome": "Добро пожаловать в ZdorMan! Здесь вы можете оплатить доступ к индикатору TradingView.",
-        "instruction": "📌 Инструкция: [Нажмите здесь](https://t.me/c/2063756053/31)",
+        "instruction_caption": "📌 Вот инструкция:",
+        "instruction_error": "⚠️ Не удалось найти файл инструкции. Пожалуйста, обратитесь в поддержку.",
         "choose_plan": "💳 Выберите тарифный план:",
-        # Новый текст для запроса TW username
         "enter_tw_username": "Введите никнейм TradingView, для которого хотите оплатить:",
         "payment_instructions": "Пожалуйста, отправьте {amount} USDT (сеть TRC-20) на следующий адрес:",
         "save_hash": "Сохраните хэш транзакции.",
         "enter_hash": "Пожалуйста, отправьте хэш транзакции:",
         "payment_received": "✅ Ваш платеж для аккаунта TradingView **{tw_username}** записан и скоро будет обработан.",
-        # Уведомления теперь включают TW username
         "subscription_expired_for": "❌ Ваша подписка для аккаунта TradingView **{tw_username}** истекла {date}.",
         "subscription_warning_for": "⚠️ Ваша подписка для аккаунта TradingView **{tw_username}** истечет через {days} дня(ей) {date}.",
         "generic_subscription_expired": "Ваша подписка истекла.",
@@ -148,10 +176,9 @@ TEXTS = {
         "help_button": "🆘 Помощь",
         "main_menu": ["📜 Инструкция", "💳 Оплата", "🆘 Поддержка"],
         "admin_access_denied": "У вас нет доступа к этой команде.",
-        "no_tw_accounts": "Аккаунты TradingView не найдены.", # Изменено
-        "select_tw_account": "Выберите аккаунт TradingView:", # Изменено
-        "client_not_found": "Данные аккаунта TradingView не найдены.", # Изменено
-        # Обновлен для отображения TW username
+        "no_tw_accounts": "Аккаунты TradingView не найдены.",
+        "select_tw_account": "Выберите аккаунт TradingView:",
+        "client_not_found": "Данные аккаунта TradingView не найдены.",
         "confirm_data": "📋 Пожалуйста, проверьте введенные данные:\n\n👤 Аккаунт TradingView: **{tw_username}**\n💰 План: {plan_name} ({amount} USDT)\n🔗 Transaction hash: `{tx_hash}`\n\nВсе верно?",
         "confirm_yes": "✅ Все верно",
         "confirm_no": "✏️ Изменить",
@@ -174,21 +201,20 @@ TEXTS = {
         "admin_back_to_list": "⬅️ Назад к списку",
         "admin_back_to_main": "⬅️ Назад в главное меню",
         "admin_history_title": "📜 История платежей для {tw_username}",
-        "admin_payment_entry": "➡️ Платеж #{i}\n📅 Дата: {date}\n💰 Сумма: {amount} USDT\n🔗 Hash: `{hash}`\n⏳ Окончание: {end_date}\n👤 Оплатил: @{tg_username} (ID: `{user_id}`)\n\n",
+        "admin_payment_entry": "➡️ Платеж #{i}\n📅 Дата: {date}\n💰 Сумма: {amount} USDT\n🔗 Hash: `{hash}`\n⏳ Окончание: {end_date}\n👤 Оплатил: @{tg_username} (ID: `{user_id}`)\n",
         "admin_back_to_account": "⬅️ Назад к инфо об аккаунте",
     },
     "es": {
         "start": "🌎 Elige un idioma:",
         "welcome": "¡Bienvenido a ZdorMan! Aquí puedes pagar el acceso al indicador de TradingView.",
-        "instruction": "📌 Instrucción: [Haz clic aquí](https://t.me/c/2063756053/31)",
+        "instruction_caption": "📌 Aquí tienes el manual de instrucciones:",
+        "instruction_error": "⚠️ No se pudo encontrar el archivo de instrucciones. Por favor, contacta con soporte.",
         "choose_plan": "💳 Elige tu plan de suscripción:",
-         # Новый текст для запроса TW username
         "enter_tw_username": "Introduce el nombre de usuario de TradingView para el que deseas pagar:",
         "payment_instructions": "Por favor, envíe {amount} USDT (red TRC-20) a la siguiente dirección:",
         "save_hash": "Guarde el hash de la transacción.",
         "enter_hash": "Por favor, envíe el hash de la transacción:",
         "payment_received": "✅ Tu pago para la cuenta de TradingView **{tw_username}** ha sido registrado y será procesado pronto.",
-        # Уведомления теперь включают TW username
         "subscription_expired_for": "❌ Tu suscripción para la cuenta de TradingView **{tw_username}** ha expirado el {date}.",
         "subscription_warning_for": "⚠️ Tu suscripción para la cuenta de TradingView **{tw_username}** expirará en {days} días el {date}.",
         "generic_subscription_expired": "Su suscripción ha expirado.",
@@ -198,10 +224,9 @@ TEXTS = {
         "help_button": "🆘 Soporte",
         "main_menu": ["📜 Instrucción", "💳 Pago", "🆘 Soporte"],
         "admin_access_denied": "No tienes acceso a este comando.",
-        "no_tw_accounts": "No se encontraron cuentas de TradingView.", # Изменено
-        "select_tw_account": "Seleccione la cuenta de TradingView:", # Изменено
-        "client_not_found": "Datos de la cuenta de TradingView no encontrados.", # Изменено
-        # Обновлен для отображения TW username
+        "no_tw_accounts": "No se encontraron cuentas de TradingView.",
+        "select_tw_account": "Seleccione la cuenta de TradingView:",
+        "client_not_found": "Datos de la cuenta de TradingView no encontrados.",
         "confirm_data": "📋 Por favor, verifique sus datos:\n\n👤 Cuenta TradingView: **{tw_username}**\n💰 Plan: {plan_name} ({amount} USDT)\n🔗 Hash de transacción: `{tx_hash}`\n\n¿Todo correcto?",
         "confirm_yes": "✅ Todo correcto",
         "confirm_no": "✏️ Editar",
@@ -224,12 +249,22 @@ TEXTS = {
         "admin_back_to_list": "⬅️ Volver a la Lista",
         "admin_back_to_main": "⬅️ Volver al Menú Principal",
         "admin_history_title": "📜 Historial de Pagos para {tw_username}",
-        "admin_payment_entry": "➡️ Pago #{i}\n📅 Fecha: {date}\n💰 Cantidad: {amount} USDT\n🔗 Hash: `{hash}`\n⏳ Fin: {end_date}\n👤 Pagado por: @{tg_username} (ID: `{user_id}`)\n\n",
+        "admin_payment_entry": "➡️ Pago #{i}\n📅 Fecha: {date}\n💰 Cantidad: {amount} USDT\n🔗 Hash: `{hash}`\n⏳ Fin: {end_date}\n👤 Pagado por: @{tg_username} (ID: `{user_id}`)\n",
         "admin_back_to_account": "⬅️ Volver a Info de Cuenta",
     }
 }
 
+
+# --- Сопоставление языков и файлов инструкций ---
+INSTRUCTION_FILES = {
+    "ru": "инструкция.pdf",
+    "es": "instrucciones.pdf",
+    "en": "manual.pdf"
+}
+DEFAULT_INSTRUCTION_FILE = "manual.pdf" # Файл по умолчанию
+
 # --- Вспомогательные функции ---
+# (get_lang, get_text - остаются без изменений)
 async def get_lang(user_id: int, state: FSMContext = None) -> str:
     """Получает язык пользователя из FSM, кэша или БД."""
     if state:
@@ -245,9 +280,23 @@ async def get_lang(user_id: int, state: FSMContext = None) -> str:
 
 def get_text(key: str, lang: str) -> str:
     """Получает текст по ключу и языку, с фоллбэком на английский."""
-    return TEXTS.get(lang, TEXTS["en"]).get(key, f"<{key}_NOT_FOUND>")
+    # Сначала пытаемся получить текст для указанного языка
+    lang_texts = TEXTS.get(lang)
+    if lang_texts:
+        text = lang_texts.get(key)
+        if text:
+            return text
+    # Если для указанного языка текста нет, пробуем английский
+    en_texts = TEXTS.get("en", {})
+    text = en_texts.get(key)
+    if text:
+        return text
+    # Если и на английском нет, возвращаем заглушку
+    return f"<{key}_NOT_FOUND_FOR_LANG_{lang}>"
+
 
 # --- Клавиатуры ---
+# (language_keyboard, main_menu, plans_keyboard - остаются без изменений)
 language_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
@@ -276,6 +325,7 @@ def plans_keyboard(lang):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # --- Сохранение пользователя и платежа ---
+# (save_user_and_payment - остается без изменений)
 async def save_user_and_payment(user_id, username, tw_username, tx_hash, amount, purchase_date, subscription_end, language):
     """Сохраняет пользователя и информацию о конкретном платеже."""
     async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -289,7 +339,6 @@ async def save_user_and_payment(user_id, username, tw_username, tx_hash, amount,
         ''', (user_id, username, language))
 
         # 2. Сохраняем платеж
-        # Используем функцию из database.py, передавая соединение
         await save_payment_db(db, user_id, tw_username, tx_hash, amount, purchase_date, subscription_end)
 
         # 3. Коммитим транзакцию
@@ -298,13 +347,14 @@ async def save_user_and_payment(user_id, username, tw_username, tx_hash, amount,
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 
+# --- /start ---
+# (start_cmd - остается без изменений)
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear() # Очищаем состояние при старте
     user_id = message.from_user.id
-    username = message.from_user.username or f"id_{user_id}" # На случай если username пустой
+    username = message.from_user.username or f"id_{user_id}"
 
-    # Сохраняем/обновляем пользователя при старте, язык пока 'en' по умолчанию
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute('''
             INSERT INTO users (user_id, username, language) VALUES (?, ?, 'en')
@@ -312,46 +362,155 @@ async def start_cmd(message: types.Message, state: FSMContext):
         ''', (user_id, username))
         await db.commit()
 
-    # Загружаем язык (если он уже был установлен ранее)
     lang = await get_lang(user_id)
-    user_languages[user_id] = lang # Обновляем кэш
+    user_languages[user_id] = lang
 
-    # Предлагаем выбрать язык снова, если нужно
     await message.answer(get_text("start", "en"), reply_markup=language_keyboard)
-    # Сразу основное меню не показываем, ждем выбора языка
 
 
+# --- Выбор языка ---
+# (set_language - остается без изменений)
 @dp.callback_query(lambda c: c.data.startswith("lang_"))
 async def set_language(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     lang = callback.data.split("_")[1]
-    user_languages[user_id] = lang # Обновляем кэш
-    await state.update_data(language=lang) # Сохраняем в FSM на всякий случай
+    user_languages[user_id] = lang
+    await state.update_data(language=lang)
 
-    # Сохраняем язык в базе данных
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute('UPDATE users SET language = ? WHERE user_id = ?', (lang, user_id))
         await db.commit()
 
     await bot.send_message(user_id, get_text("welcome", lang), reply_markup=main_menu(lang))
-    # Удаляем сообщение с выбором языка
     try:
         await callback.message.delete()
     except Exception as e:
         logging.warning(f"Не удалось удалить сообщение выбора языка: {e}")
     await callback.answer()
 
-
+# --- Обработчик кнопки "Инструкция" (ИЗМЕНЕН с кешированием file_id) ---
 @dp.message(lambda message: message.text in [
     TEXTS["en"]["main_menu"][0], TEXTS["ru"]["main_menu"][0], TEXTS["es"]["main_menu"][0]
 ])
 async def send_instruction(message: types.Message, state: FSMContext):
-    lang = await get_lang(message.from_user.id, state)
-    await message.answer(get_text("instruction", lang), parse_mode="Markdown", disable_web_page_preview=True)
+    user_id = message.from_user.id
+    lang = await get_lang(user_id, state)
+    instruction_filename = INSTRUCTION_FILES.get(lang, DEFAULT_INSTRUCTION_FILE)
+    caption_text = get_text("instruction_caption", lang)
+    error_text = get_text("instruction_error", lang) # Текст при ошибке
+    global instruction_file_ids # Указываем, что работаем с глобальным кешем
+
+    cached_file_id = instruction_file_ids.get(instruction_filename)
+
+    if cached_file_id:
+        # --- Используем кешированный file_id ---
+        logging.info(f"Используем кеш file_id для '{instruction_filename}' (user: {user_id})")
+        try:
+            await bot.send_document(
+                chat_id=user_id,
+                document=cached_file_id,
+                caption=caption_text
+            )
+            return # Успешно отправили из кеша
+        except TelegramBadRequest as e:
+            # Если file_id стал недействительным (редко, но возможно)
+            logging.warning(f"Недействительный file_id '{cached_file_id}' для '{instruction_filename}': {e}. Удаляем из кеша.")
+            del instruction_file_ids[instruction_filename] # Удаляем неверный ID из кеша
+            save_cache() # Сохраняем обновленный кеш без невалидного ID
+            # Продолжаем выполнение, чтобы отправить файл заново
+        except Exception as e:
+             logging.error(f"Ошибка отправки документа по file_id '{cached_file_id}' пользователю {user_id}: {e}")
+             await message.answer(get_text("error_occurred", lang))
+             return # Прерываем выполнение при другой ошибке
+
+    # --- Отправка файла (если file_id не кеширован или стал недействительным) ---
+    file_path = os.path.join(MEDIA_DIR, instruction_filename)
+    logging.info(f"Отправка файла '{instruction_filename}' пользователю {user_id} (язык: {lang}), file_id не кеширован или невалиден.")
+
+    if os.path.exists(file_path):
+        try:
+            # Показываем статус "Отправка документа..."
+            await bot.send_chat_action(chat_id=user_id, action=ChatAction.UPLOAD_DOCUMENT)
+            # Отправляем файл
+            document_to_send = FSInputFile(file_path)
+            sent_message = await bot.send_document(
+                chat_id=user_id,
+                document=document_to_send,
+                caption=caption_text
+            )
+            # Кешируем file_id, если отправка прошла успешно
+            if sent_message and sent_message.document:
+                new_file_id = sent_message.document.file_id
+                instruction_file_ids[instruction_filename] = new_file_id
+                save_cache() # Сохраняем обновленный кеш
+                logging.info(f"Успешно отправлен и кеширован file_id '{new_file_id}' для '{instruction_filename}'")
+            else:
+                 logging.warning(f"Не удалось получить file_id после отправки '{instruction_filename}' пользователю {user_id}")
+
+        except Exception as e:
+            logging.error(f"Ошибка отправки файла инструкции '{file_path}' пользователю {user_id}: {e}")
+            await message.answer(get_text("error_occurred", lang)) # Общая ошибка
+    else:
+        # Если файл для выбранного языка не найден
+        logging.warning(f"Файл инструкции не найден: {file_path} (язык: {lang})")
+        # Пытаемся отправить файл по умолчанию (английский)
+        default_file_path = os.path.join(MEDIA_DIR, DEFAULT_INSTRUCTION_FILE)
+        default_caption = get_text("instruction_caption", 'en')
+
+        # Проверяем, есть ли file_id для файла по умолчанию в кеше
+        cached_default_id = instruction_file_ids.get(DEFAULT_INSTRUCTION_FILE)
+        if cached_default_id:
+             logging.info(f"Отправляем инструкцию по умолчанию '{DEFAULT_INSTRUCTION_FILE}' из кеша пользователю {user_id}.")
+             try:
+                 await bot.send_document(
+                     chat_id=user_id,
+                     document=cached_default_id,
+                     caption=default_caption
+                 )
+                 return # Успешно отправили дефолтный файл из кеша
+             except TelegramBadRequest as e:
+                 logging.warning(f"Недействительный file_id '{cached_default_id}' для default '{DEFAULT_INSTRUCTION_FILE}': {e}. Удаляем из кеша.")
+                 if DEFAULT_INSTRUCTION_FILE in instruction_file_ids:
+                      del instruction_file_ids[DEFAULT_INSTRUCTION_FILE]
+                      save_cache()
+                 # Продолжаем, чтобы попробовать отправить дефолтный файл заново
+             except Exception as e:
+                 logging.error(f"Ошибка отправки default документа по file_id '{cached_default_id}' пользователю {user_id}: {e}")
+                 await message.answer(error_text) # Сообщаем об ошибке, если даже кеш не сработал
+                 return
+
+        # Если кеша для дефолтного файла нет или он стал невалидным
+        if lang != 'en' and os.path.exists(default_file_path):
+            logging.info(f"Отправляем инструкцию по умолчанию '{DEFAULT_INSTRUCTION_FILE}' (файл) пользователю {user_id}.")
+            try:
+                await bot.send_chat_action(chat_id=user_id, action=ChatAction.UPLOAD_DOCUMENT)
+                document_to_send = FSInputFile(default_file_path)
+                sent_message = await bot.send_document(
+                    chat_id=user_id,
+                    document=document_to_send,
+                    caption=default_caption
+                )
+                # Кешируем file_id для файла по умолчанию
+                if sent_message and sent_message.document:
+                    new_file_id = sent_message.document.file_id
+                    instruction_file_ids[DEFAULT_INSTRUCTION_FILE] = new_file_id
+                    save_cache()
+                    logging.info(f"Успешно отправлен и кеширован file_id '{new_file_id}' для default '{DEFAULT_INSTRUCTION_FILE}'")
+                else:
+                    logging.warning(f"Не удалось получить file_id после отправки default '{DEFAULT_INSTRUCTION_FILE}' пользователю {user_id}")
+
+            except Exception as e:
+                 logging.error(f"Ошибка отправки файла инструкции по умолчанию '{default_file_path}' пользователю {user_id}: {e}")
+                 await message.answer(error_text) # Сообщаем об ошибке, если и дефолтный не ушел
+        else:
+            # Если и файл по умолчанию не найден, или язык и так английский
+             logging.error(f"Файл инструкции по умолчанию '{DEFAULT_INSTRUCTION_FILE}' также не найден.")
+             await message.answer(error_text)
 
 
 # --- Процесс Оплаты ---
-
+# (start_payment_process, process_plan_selection, process_tw_username,
+#  process_paid_button, process_hash, confirm_payment, reject_payment - без изменений)
 # 1. Нажатие кнопки "Оплата" -> Предлагаем выбрать план
 @dp.message(lambda message: message.text in [
     TEXTS["en"]["main_menu"][1], TEXTS["ru"]["main_menu"][1], TEXTS["es"]["main_menu"][1]
@@ -385,7 +544,6 @@ async def process_plan_selection(callback: types.CallbackQuery, state: FSMContex
 async def process_tw_username(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     tw_username = message.text.strip() # Убираем лишние пробелы
-    # Можно добавить валидацию формата TW username, если нужно
     if not tw_username:
          lang = await get_lang(user_id, state)
          await message.answer(get_text("enter_tw_username", lang)) # Повторно просим ввести
@@ -404,7 +562,7 @@ async def process_tw_username(message: types.Message, state: FSMContext):
     ])
 
     try:
-        photo_path = os.path.join("media", "1.jpg")
+        photo_path = os.path.join(MEDIA_DIR, "1.jpg")
         if os.path.exists(photo_path):
             photo = FSInputFile(photo_path)
             await bot.send_photo(
@@ -535,6 +693,7 @@ async def reject_payment(callback: types.CallbackQuery, state: FSMContext):
 
 
 # --- Поддержка ---
+# (support_handler - без изменений)
 @dp.message(lambda message: message.text in [
     TEXTS["en"]["main_menu"][2], TEXTS["ru"]["main_menu"][2], TEXTS["es"]["main_menu"][2]
 ])
@@ -542,8 +701,8 @@ async def support_handler(message: types.Message, state: FSMContext):
     lang = await get_lang(message.from_user.id, state)
     await message.answer(get_text("support", lang))
 
-# ========== АДМИН ПАНЕЛЬ (Переработана под TW Аккаунты) ==========
-
+# ========== АДМИН ПАНЕЛЬ ==========
+# (admin_panel, list_tw_accounts, client_info, payment_history, admin_back_to_main - без изменений)
 # Вход в админ панель
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
@@ -729,8 +888,10 @@ async def admin_back_to_main(callback: types.CallbackQuery):
      await callback.answer()
 
 # ========== ЗАПУСК БОТА ==========
-
 async def main():
+    # Загружаем кеш file_id из файла
+    load_cache()
+
     # Инициализация БД
     await init_database_module()
 
@@ -743,13 +904,24 @@ async def main():
             logging.info(f"Загружено {len(user_languages)} языковых настроек пользователей.")
 
     # Запускаем планировщик проверки подписок
-    # Передаем ему словарь TEXTS для локализации уведомлений
     asyncio.create_task(start_scheduler(bot, TEXTS))
     logging.info("Запуск опроса бота...")
-    await dp.start_polling(bot)
+    # Регистрируем обработчик для сохранения кеша при выключении
+    # dp.shutdown.register(save_cache) # Не работает в asyncio.run? Проще сохранять после каждого добавления.
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Сохраняем кеш при остановке бота (даже при ошибке или KeyboardInterrupt)
+        logging.info("Бот останавливается, сохраняем кеш file_id...")
+        save_cache()
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    if not os.path.exists(MEDIA_DIR):
+        os.makedirs(MEDIA_DIR)
+        logging.info(f"Создана директория: {MEDIA_DIR}")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
